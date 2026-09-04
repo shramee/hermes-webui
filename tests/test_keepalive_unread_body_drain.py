@@ -22,12 +22,12 @@ import io
 import json
 import socket
 import threading
-from email.message import Message
 from unittest import mock
 
 import pytest
 
 import api.auth
+from api.helpers import MAX_BODY_BYTES
 from http.server import BaseHTTPRequestHandler
 from server import Handler, QuietHTTPServer, _BodyTrackingReader
 
@@ -213,6 +213,28 @@ def test_negative_content_length_fails_closed(password_auth):
     assert connection_alive is False, (get_status, get_body[:200])
 
 
+def test_oversized_content_length_fails_closed_without_draining():
+    """A Content-Length ``read_body`` would refuse must close, not drain.
+
+    A rejected request claiming more than MAX_BODY_BYTES must fail the
+    connection closed immediately: draining it would burn bandwidth and pin
+    a thread, and ``read_body`` itself closes on such lengths — the drain
+    mirrors that cap so both paths use the same limit. Asserts zero bytes
+    are consumed (pre-cap code would read the buffered bytes first).
+    """
+    body = b"x" * 100
+    handler = Handler.__new__(Handler)
+    handler.rfile = _BodyTrackingReader(io.BytesIO(body))  # type: ignore[assignment]
+    handler.headers = {"Content-Length": str(MAX_BODY_BYTES + 1)}  # type: ignore[assignment]
+    handler.close_connection = False
+
+    handler._drain_unread_body()
+
+    assert handler.close_connection is True
+    assert handler.rfile.count == 0  # type: ignore[attr-defined]
+    assert handler.rfile._inner.getvalue() == body  # type: ignore[attr-defined]
+
+
 def test_body_byte_counter_resets_per_request(password_auth):
     """After a request whose body WAS read, a later early-exit POST must still drain.
 
@@ -380,39 +402,35 @@ def test_stale_headers_fail_closed(password_auth):
 def test_stale_headers_never_authorize_a_drain():
     """The per-request finally must close, never drain, without current headers.
 
-    Pins the fail-closed boundary added for the PR #7368 maintainer review:
-    if a request fails before header parsing assigns current headers while
-    stale request-A framing is still present and the connection is still
-    marked reusable (e.g. a stdlib path that answers an error without
-    closing), the finally must close the connection rather than consume
-    bytes under the stale Content-Length.
+    If a request fails before header parsing assigns current headers while
+    the connection is still marked reusable (e.g. a stdlib path that answers
+    an error without closing), the finally must close the connection rather
+    than consume bytes under any framing. ``handle_one_request`` clears
+    ``headers`` before dispatch, so the stub below sees ``None`` — there is
+    no stale request-A framing left to inherit.
 
-    The stdlib stub simulates exactly that path: it returns without
-    assigning headers and without closing, leaving request A's
-    ``Content-Length: 60`` in place. ``c_bytes`` stands in for bytes after
-    malformed B (pipelined request C): pre-fix the stale drain consumes 60
-    of them as B's "body" and leaves the connection open; fixed, the
-    connection closes and every byte is untouched.
+    ``c_bytes`` stands in for bytes after malformed B (pipelined request C):
+    without the fail-closed boundary the drain would consume bytes as B's
+    "body" and leave the connection open; fixed, the connection closes and
+    every byte is untouched.
     """
-    stale = Message()
-    stale["Content-Length"] = "60"
     c_bytes = (
         b"GET /api/session?session_id=20260827_080609_a123e437 HTTP/1.1\r\n"
         b"Host: 127.0.0.1\r\n"
         b"Connection: keep-alive\r\n"
         b"\r\n"
     )
-    assert len(c_bytes) > 60, len(c_bytes)
 
     handler = Handler.__new__(Handler)
     handler.rfile = _BodyTrackingReader(io.BytesIO(c_bytes))  # type: ignore[assignment]
-    handler.headers = stale
+    handler.headers = None  # type: ignore[assignment]
     handler.close_connection = False
 
     def _return_before_headers(handler_self):
         # Simulates a stdlib path that answers before parse_request assigns
-        # current headers (overlong request line) without closing.
-        assert handler_self.headers is stale
+        # current headers (overlong request line) without closing. The
+        # per-request reset in handle_one_request has already cleared headers.
+        assert handler_self.headers is None
         assert handler_self.close_connection is False
 
     with mock.patch.object(
